@@ -53,18 +53,19 @@ impl std::fmt::Display for HttpClient {
         write!(f, "{}", output)
     }
 }
-impl Drop for HttpClient {
-    fn drop(&mut self) {
-        let _ = self.stream.shutdown(std::net::Shutdown::Both);
-    }
-}
 impl Eq for HttpClient {}
 impl PartialEq for HttpClient {
     fn eq(&self, other: &Self) -> bool {
-        self.incoming == other.incoming && self.outgoing == other.outgoing
+        self.incoming.eq(&other.incoming) && self.outgoing.eq(&other.outgoing)
     }
 }
 impl HttpClient {
+    pub fn close(self) -> std::io::Result<()> {
+        self.stream.shutdown(std::net::Shutdown::Both)
+    }
+    pub fn get_stream(&self) -> std::io::Result<TcpStream> {
+        self.stream.try_clone()
+    }
     pub fn new(
         mut stream: TcpStream,
         config: &HttpRequestConfig,
@@ -371,7 +372,7 @@ impl HttpRequest {
                 Ok(()) => {
                     method.push(byte[0]);
                     if method.ends_with(b" ") {
-                        method = method[0..=(method.len() - 1 - 1)].to_vec();
+                        method = method[0..(method.len() - 1)].to_vec();
                         break;
                     } else if index == config.max_method_len {
                         return Err(ParseHttpRequestError::OversizedMethod);
@@ -388,7 +389,7 @@ impl HttpRequest {
                 Ok(()) => {
                     path.push(byte[0]);
                     if path.ends_with(b" ") {
-                        path = path[0..=(path.len() - 1 - 1)].to_vec();
+                        path = path[0..(path.len() - 1)].to_vec();
                         break;
                     } else if index == config.max_path_len {
                         return Err(ParseHttpRequestError::OversizedPath);
@@ -405,9 +406,9 @@ impl HttpRequest {
                 Ok(()) => {
                     protocol.push(byte[0]);
                     if protocol.ends_with(b"\r\n") {
-                        protocol = protocol[0..=(protocol.len() - 2 - 1)].to_vec();
+                        protocol = protocol[0..(protocol.len() - 2)].to_vec();
                         break;
-                    } else if index == config.max_protocol_len {
+                    } else if index == (config.max_protocol_len + 1) {
                         return Err(ParseHttpRequestError::OversizedProtocol);
                     }
                 }
@@ -422,13 +423,13 @@ impl HttpRequest {
                 Ok(()) => {
                     headers.push(byte[0]);
                     if headers.ends_with(b"\r\n\r\n") {
-                        headers = headers[0..=(headers.len() - 4 - 1)].to_vec();
+                        headers = headers[0..(headers.len() - 4)].to_vec();
                         break;
-                    } else if index == config.max_header_len {
+                    } else if index == config.max_header_len + 3 {
                         return Err(ParseHttpRequestError::OversizedHeaders);
                     }
                 }
-                Err(_) => return Err(ParseHttpRequestError::MissingOrIncompleteMethod),
+                Err(_) => break, // As 0 headers are allowed
             }
         }
         // Parse body
@@ -451,9 +452,9 @@ impl HttpRequest {
         let mut header_map = HashMap::new();
         for line in headers.lines() {
             if let Some((key, value)) = line.split_once(": ") {
-                header_map.insert(key.to_lowercase(), value.to_owned());
+                header_map.insert(key.to_owned(), value.to_owned());
             } else if let Some((key, value)) = line.split_once(":") {
-                header_map.insert(key.to_lowercase(), value.to_owned());
+                header_map.insert(key.to_owned(), value.to_owned());
             }
         }
         let method = String::from_utf8(method)
@@ -476,7 +477,7 @@ impl HttpRequest {
         })
     }
 }
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParseHttpRequestError {
     CantSetTimeout,
     InvalidUtf8,
@@ -563,7 +564,7 @@ mod tests {
                 protocol: "HTTP/1.1".to_owned(),
                 headers: {
                     let mut map = HashMap::new();
-                    map.insert("Accept".to_owned(), "*/*".to_owned());
+                    map.insert("accept".to_owned(), "*/*".to_owned());
                     map
                 },
                 body: b"This is the body!".to_vec(),
@@ -585,7 +586,201 @@ mod tests {
             .unwrap();
         assert_eq!(
             format!("{}", builder),
-            "HTTP/1.1 200 Ok\r\nAccept: */*\r\n\r\nThis is the body!"
+            "HTTP/1.1 200 Ok\r\naccept: */*\r\n\r\nThis is the body!"
         );
+    }
+    #[test]
+    fn zero_len_method() {
+        let tcp_listener = TcpListener::bind("127.0.0.1:53629").unwrap();
+        let mut client = TcpStream::connect("127.0.0.1:53629").unwrap();
+        client
+            .write_all(b" /test/bla HTTP/1.1\r\nAccept: */*\r\n\r\nThis is the body!")
+            .unwrap();
+        let config = HttpRequestConfig::default();
+        let client = HttpClient::new(tcp_listener.accept().unwrap().0, &config);
+        assert_eq!(client, Err(ParseHttpRequestError::InvalidMethod));
+        // This means te length of the method wasnt an issue, rather the content of the method was
+        // the problem, so this actually passes despite being an Err() type
+    }
+    #[test]
+    fn zero_len_path() {
+        let tcp_listener = TcpListener::bind("127.0.0.1:53630").unwrap();
+        let mut client = TcpStream::connect("127.0.0.1:53630").unwrap();
+        client
+            .write_all(b"GET  HTTP/1.1\r\nAccept: */*\r\n\r\nThis is the body!")
+            .unwrap();
+        let config = HttpRequestConfig::default();
+        let client = HttpClient::new(tcp_listener.accept().unwrap().0, &config).unwrap();
+        assert_eq!(client.incoming.path, "");
+    }
+    #[test]
+    fn zero_len_protocol() {
+        let tcp_listener = TcpListener::bind("127.0.0.1:53631").unwrap();
+        let mut client = TcpStream::connect("127.0.0.1:53631").unwrap();
+        client
+            .write_all(b"GET /test/bla \r\nAccept: */*\r\n\r\nThis is the body!")
+            .unwrap();
+        let config = HttpRequestConfig::default();
+        let client = HttpClient::new(tcp_listener.accept().unwrap().0, &config).unwrap();
+        assert_eq!(client.incoming.protocol, "");
+    }
+    #[test]
+    fn zero_len_headers() {
+        let tcp_listener = TcpListener::bind("127.0.0.1:53643").unwrap();
+        let mut client = TcpStream::connect("127.0.0.1:53643").unwrap();
+        client
+            .write_all(b"GET /test/bla HTTP/1.1\r\n\r\nThis is the body!")
+            .unwrap();
+        let config = HttpRequestConfig::default();
+        let client = HttpClient::new(tcp_listener.accept().unwrap().0, &config).unwrap();
+        assert_eq!(client.incoming.headers, HashMap::new());
+    }
+    #[test]
+    fn zero_len_body() {
+        let tcp_listener = TcpListener::bind("127.0.0.1:53644").unwrap();
+        let mut client = TcpStream::connect("127.0.0.1:53644").unwrap();
+        client
+            .write_all(b"GET /test/bla HTTP/1.1\r\nAccept: */*\r\n")
+            .unwrap();
+        let config = HttpRequestConfig::default();
+        let client = HttpClient::new(tcp_listener.accept().unwrap().0, &config).unwrap();
+        assert_eq!(client.incoming.body, []);
+    }
+
+    #[test]
+    fn of_size_method() {
+        let tcp_listener = TcpListener::bind("127.0.0.1:53632").unwrap();
+        let mut client = TcpStream::connect("127.0.0.1:53632").unwrap();
+        client
+            .write_all(b"ABCDEFGHIJ /test/bla HTTP/1.1\r\nAccept: */*\r\n\r\nThis is the body!")
+            .unwrap();
+        let config = HttpRequestConfig::default();
+        let client = HttpClient::new(tcp_listener.accept().unwrap().0, &config);
+        assert_eq!(client, Err(ParseHttpRequestError::InvalidMethod));
+        // This means te length of the method wasnt an issue, rather the content of the method was
+        // the problem, so this actually passes despite being an Err() type
+    }
+    #[test]
+    fn of_size_path() {
+        let tcp_listener = TcpListener::bind("127.0.0.1:53633").unwrap();
+        let mut client = TcpStream::connect("127.0.0.1:53633").unwrap();
+        client
+            .write_all(b"GET /1234 HTTP/1.1\r\nAccept: */*\r\n\r\nThis is the body!")
+            .unwrap();
+        let config = HttpRequestConfig {
+            max_path_len: 5,
+            ..Default::default()
+        };
+        let client = HttpClient::new(tcp_listener.accept().unwrap().0, &config).unwrap();
+        assert_eq!(client.incoming.path, "/1234");
+    }
+    #[test]
+    fn of_size_protocol() {
+        let tcp_listener = TcpListener::bind("127.0.0.1:53634").unwrap();
+        let mut client = TcpStream::connect("127.0.0.1:53634").unwrap();
+        client
+            .write_all(b"GET /test/bla ABCDE\r\nAccept: */*\r\n\r\nThis is the body!")
+            .unwrap();
+        let config = HttpRequestConfig {
+            max_protocol_len: 5,
+            ..Default::default()
+        };
+        let client = HttpClient::new(tcp_listener.accept().unwrap().0, &config).unwrap();
+        assert_eq!(client.incoming.protocol, "ABCDE");
+    }
+    #[test]
+    fn of_size_headers() {
+        let tcp_listener = TcpListener::bind("127.0.0.1:53640").unwrap();
+        let mut client = TcpStream::connect("127.0.0.1:53640").unwrap();
+        client
+            .write_all(b"GET /test/bla HTTP/1.1\r\nABC: DEFGH\r\n\r\nThis is the body!")
+            .unwrap();
+        let config = HttpRequestConfig {
+            max_header_len: 10,
+            ..Default::default()
+        };
+        let client = HttpClient::new(tcp_listener.accept().unwrap().0, &config);
+        assert_eq!(
+            client.unwrap().incoming.headers.get("abc").unwrap(),
+            "DEFGH"
+        );
+    }
+    #[test]
+    fn of_size_body() {
+        let tcp_listener = TcpListener::bind("127.0.0.1:53642").unwrap();
+        let mut client = TcpStream::connect("127.0.0.1:53642").unwrap();
+        client
+            .write_all(b"GET /test/bla HTTP/1.1\r\nAccept: */*\r\n\r\nABCDEFGHIJ")
+            .unwrap();
+        let config = HttpRequestConfig {
+            max_body_len: 10,
+            ..Default::default()
+        };
+        let client = HttpClient::new(tcp_listener.accept().unwrap().0, &config);
+        assert_eq!(client.unwrap().incoming.body, b"ABCDEFGHIJ".to_vec());
+    }
+    #[test]
+    fn oversized_method() {
+        let tcp_listener = TcpListener::bind("127.0.0.1:53641").unwrap();
+        let mut client = TcpStream::connect("127.0.0.1:53641").unwrap();
+        client
+            .write_all(b"ABCDEFGHIJK /test/bla HTTP/1.1\r\nAccept: */*\r\n\r\nThis is the body!")
+            .unwrap();
+        let config = HttpRequestConfig::default();
+        let client = HttpClient::new(tcp_listener.accept().unwrap().0, &config);
+        assert_eq!(client, Err(ParseHttpRequestError::OversizedMethod));
+    }
+    #[test]
+    fn oversized_path() {
+        let tcp_listener = TcpListener::bind("127.0.0.1:53636").unwrap();
+        let mut client = TcpStream::connect("127.0.0.1:53636").unwrap();
+        client
+            .write_all(b"GET /12345 HTTP/1.1\r\nAccept: */*\r\n\r\nThis is the body!")
+            .unwrap();
+        let config = HttpRequestConfig {
+            max_path_len: 5,
+            ..Default::default()
+        };
+        let client = HttpClient::new(tcp_listener.accept().unwrap().0, &config);
+        assert_eq!(client, Err(ParseHttpRequestError::OversizedPath));
+    }
+    #[test]
+    fn oversized_protocol() {
+        let tcp_listener = TcpListener::bind("127.0.0.1:53637").unwrap();
+        let mut client = TcpStream::connect("127.0.0.1:53637").unwrap();
+        client
+            .write_all(b"GET /test/bla ABCDEFGHIJK\r\nAccept: */*\r\n\r\nThis is the body!")
+            .unwrap();
+        let config = HttpRequestConfig::default();
+        let client = HttpClient::new(tcp_listener.accept().unwrap().0, &config);
+        assert_eq!(client, Err(ParseHttpRequestError::OversizedProtocol));
+    }
+    #[test]
+    fn oversized_headers() {
+        let tcp_listener = TcpListener::bind("127.0.0.1:53638").unwrap();
+        let mut client = TcpStream::connect("127.0.0.1:53638").unwrap();
+        client
+            .write_all(b"GET /test/bla HTTP/1.1\r\nABC: DEFGHI\r\n\r\nThis is the body!")
+            .unwrap();
+        let config = HttpRequestConfig {
+            max_header_len: 10,
+            ..Default::default()
+        };
+        let client = HttpClient::new(tcp_listener.accept().unwrap().0, &config);
+        assert_eq!(client, Err(ParseHttpRequestError::OversizedHeaders));
+    }
+    #[test]
+    fn oversized_body() {
+        let tcp_listener = TcpListener::bind("127.0.0.1:53639").unwrap();
+        let mut client = TcpStream::connect("127.0.0.1:53639").unwrap();
+        client
+            .write_all(b"GET /test/bla HTTP/1.1\r\nAccept: */*\r\n\r\nABCDEFGHIJK")
+            .unwrap();
+        let config = HttpRequestConfig {
+            max_body_len: 10,
+            ..Default::default()
+        };
+        let client = HttpClient::new(tcp_listener.accept().unwrap().0, &config);
+        assert_eq!(client, Err(ParseHttpRequestError::OversizedBody));
     }
 }
